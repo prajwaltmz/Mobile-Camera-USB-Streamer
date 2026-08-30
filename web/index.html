@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mobile Camera (USB) - Hardware Encoded</title>
+    <style>
+        body { margin: 0; padding: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+        video { width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; z-index: 1; }
+        .controls { position: absolute; bottom: 20px; z-index: 2; display: flex; gap: 15px; background: rgba(0,0,0,0.5); padding: 15px; border-radius: 30px; backdrop-filter: blur(5px); }
+        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 20px; font-weight: bold; cursor: pointer; font-size: 14px; }
+        button:active { background: #2980b9; }
+        .status { position: absolute; top: 20px; z-index: 2; background: rgba(0,0,0,0.5); padding: 5px 15px; border-radius: 15px; font-size: 14px; }
+        .status.connected { color: #2ecc71; }
+        .status.disconnected { color: #e74c3c; }
+    </style>
+</head>
+<body>
+
+    <div class="status disconnected" id="statusIndicator">Disconnected</div>
+    <video id="localVideo" autoplay playsinline muted></video>
+    
+    <div class="controls">
+        <button id="btnSwitch">Flip Camera</button>
+        <button id="btnRotate">Rotate 90°</button>
+        <button id="btnConnect">Connect</button>
+    </div>
+
+    <script>
+        const video = document.getElementById('localVideo');
+        const btnSwitch = document.getElementById('btnSwitch');
+        const btnRotate = document.getElementById('btnRotate');
+        const btnConnect = document.getElementById('btnConnect');
+        const statusInd = document.getElementById('statusIndicator');
+        
+        let currentFacingMode = 'environment';
+        let rotation = 0;
+        let localStream = null;
+        let wsData = null;
+        let wsControls = null;
+        let isConnected = false;
+        
+        let videoEncoder = null;
+        let encodeLoopActive = false;
+        let frameCount = 0;
+        let audioContext = null;
+        let audioSource = null;
+        let audioWorkletNode = null;
+        
+        const TYPE_VIDEO = 0x01;
+        const TYPE_AUDIO = 0x02;
+        const BACKPRESSURE_LIMIT_BYTES = 1500000;
+
+        async function initCamera() {
+            if (localStream) {
+                localStream.getTracks().forEach(t => t.stop());
+            }
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: currentFacingMode, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+                    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }
+                });
+                video.srcObject = localStream;
+                
+                if (isConnected) {
+                    await startEncoding();
+                }
+            } catch (e) {
+                console.error("Camera error:", e);
+                alert("Could not access camera/mic.");
+            }
+        }
+
+        btnSwitch.addEventListener('click', async () => {
+            const wasConnected = isConnected;
+            if (wasConnected) stopEncoding();
+            currentFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
+            await initCamera();
+        });
+
+        function connectControls() {
+            const host = window.location.host;
+            wsControls = new WebSocket(`ws://${host}/ws/controls`);
+            wsControls.onopen = () => {
+                wsControls.send(JSON.stringify({ command: 'rotation', value: rotation }));
+            };
+        }
+
+        btnRotate.addEventListener('click', () => {
+            rotation = (rotation + 90) % 360;
+            if (wsControls && wsControls.readyState === WebSocket.OPEN) {
+                wsControls.send(JSON.stringify({ command: 'rotation', value: rotation }));
+            }
+        });
+
+        function sendData(type, payloadBuffer) {
+            if (!isConnected || !wsData || wsData.readyState !== WebSocket.OPEN) return;
+            
+            // Backpressure check
+            if (wsData.bufferedAmount > BACKPRESSURE_LIMIT_BYTES) {
+                // Drop if socket is backed up
+                return; 
+            }
+            
+            const header = new Uint8Array([type]);
+            const blob = new Blob([header, payloadBuffer]);
+            wsData.send(blob);
+        }
+
+        async function startEncoding() {
+            if (!localStream) return;
+            
+            // 1. Setup Audio Pipeline
+            const audioTracks = localStream.getAudioTracks();
+            if (audioTracks.length > 0) {
+                audioContext = new AudioContext({ sampleRate: 48000 });
+                await audioContext.audioWorklet.addModule('audio-processor.js');
+                
+                audioSource = audioContext.createMediaStreamSource(localStream);
+                audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-audio-processor');
+                
+                audioWorkletNode.port.onmessage = (event) => {
+                    const float32Array = event.data;
+                    const int16Array = new Int16Array(float32Array.length);
+                    for (let i = 0; i < float32Array.length; i++) {
+                        let s = float32Array[i];
+                        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    sendData(TYPE_AUDIO, int16Array.buffer);
+                };
+                
+                audioSource.connect(audioWorkletNode);
+                audioWorkletNode.connect(audioContext.destination);
+            }
+            
+            // 2. Setup Video Pipeline
+            const videoTrack = localStream.getVideoTracks()[0];
+            const settings = videoTrack.getSettings();
+            
+            videoEncoder = new VideoEncoder({
+                output: (chunk, metadata) => {
+                    const payload = new Uint8Array(chunk.byteLength);
+                    chunk.copyTo(payload);
+                    sendData(TYPE_VIDEO, payload.buffer);
+                },
+                error: (e) => {
+                    console.error("VideoEncoder error:", e);
+                }
+            });
+            
+            // Find a supported codec
+            const candidates = [
+                "avc1.640028", // High Profile 4.0
+                "avc1.4d0028", // Main Profile 4.0
+                "avc1.420028", // Baseline Profile 4.0
+                "avc1.42E02A"  // Baseline Profile 4.2
+            ];
+            
+            let selectedCodec = "avc1.420028"; // Fallback
+            for (const codec of candidates) {
+                const config = {
+                    codec: codec,
+                    width: settings.width || 1920,
+                    height: settings.height || 1080,
+                    bitrate: 8_000_000,
+                    framerate: settings.frameRate || 30,
+                    latencyMode: 'realtime',
+                    hardwareAcceleration: 'prefer-hardware',
+                    avc: { format: 'annexb' }
+                };
+                try {
+                    const support = await VideoEncoder.isConfigSupported(config);
+                    if (support.supported) {
+                        selectedCodec = codec;
+                        videoEncoder.configure(support.config);
+                        break;
+                    }
+                } catch (e) {
+                    console.error("isConfigSupported error for", codec, e);
+                }
+            }
+            
+            if (videoEncoder.state !== 'configured') {
+                videoEncoder.configure({
+                    codec: selectedCodec,
+                    width: settings.width || 1920,
+                    height: settings.height || 1080,
+                    bitrate: 8_000_000,
+                    framerate: settings.frameRate || 30,
+                    latencyMode: 'realtime',
+                    hardwareAcceleration: 'prefer-hardware',
+                    avc: { format: 'annexb' }
+                });
+            }
+            
+            encodeLoopActive = true;
+            frameCount = 0;
+            
+            // Use requestVideoFrameCallback for exact frame pacing
+            const processFrame = (now, metadata) => {
+                if (!encodeLoopActive) return;
+                
+                // Backpressure check: don't encode if encoder is backed up or socket is backed up
+                if (videoEncoder.encodeQueueSize <= 2 && wsData.bufferedAmount <= BACKPRESSURE_LIMIT_BYTES) {
+                    const frame = new VideoFrame(video, { timestamp: metadata.mediaTime * 1e6 });
+                    
+                    // Force keyframe on first frame, and every 60 frames (~2 seconds at 30fps)
+                    const isKeyframe = (frameCount % 60 === 0);
+                    videoEncoder.encode(frame, { keyFrame: isKeyframe });
+                    
+                    frame.close();
+                    frameCount++;
+                }
+                
+                video.requestVideoFrameCallback(processFrame);
+            };
+            
+            video.requestVideoFrameCallback(processFrame);
+        }
+
+        function stopEncoding() {
+            encodeLoopActive = false;
+            if (videoEncoder) {
+                if (videoEncoder.state !== 'closed') {
+                    videoEncoder.close();
+                }
+                videoEncoder = null;
+            }
+            if (audioWorkletNode) {
+                audioWorkletNode.disconnect();
+                audioWorkletNode = null;
+            }
+            if (audioSource) {
+                audioSource.disconnect();
+                audioSource = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+        }
+
+        let autoReconnectTimeout = null;
+
+        function connectSockets() {
+            if (isConnected) return;
+            
+            const host = window.location.host;
+            wsData = new WebSocket(`ws://${host}/ws/data`);
+            wsData.binaryType = 'blob';
+            
+            wsData.onopen = async () => {
+                isConnected = true;
+                statusInd.textContent = 'Connected (H.264 VPU)';
+                statusInd.className = 'status connected';
+                btnConnect.textContent = 'Disconnect';
+                
+                if (autoReconnectTimeout) {
+                    clearTimeout(autoReconnectTimeout);
+                    autoReconnectTimeout = null;
+                }
+                
+                connectControls();
+                await startEncoding();
+            };
+            
+            wsData.onclose = () => {
+                handleDisconnect(true);
+            };
+            wsData.onerror = () => {
+                handleDisconnect(true);
+            };
+        }
+
+        function handleDisconnect(autoReconnect = false) {
+            isConnected = false;
+            stopEncoding();
+            
+            if (wsData) { wsData.onclose = null; wsData.onerror = null; wsData.close(); wsData = null; }
+            if (wsControls) { wsControls.close(); wsControls = null; }
+            
+            if (autoReconnect) {
+                statusInd.textContent = 'Reconnecting...';
+                statusInd.className = 'status disconnected';
+                if (!autoReconnectTimeout) {
+                    autoReconnectTimeout = setTimeout(() => {
+                        autoReconnectTimeout = null;
+                        connectSockets();
+                    }, 2000);
+                }
+            } else {
+                statusInd.textContent = 'Disconnected';
+                statusInd.className = 'status disconnected';
+                btnConnect.textContent = 'Connect';
+                if (autoReconnectTimeout) {
+                    clearTimeout(autoReconnectTimeout);
+                    autoReconnectTimeout = null;
+                }
+            }
+        }
+
+        btnConnect.addEventListener('click', () => {
+            if (isConnected || autoReconnectTimeout) handleDisconnect(false);
+            else connectSockets();
+        });
+
+        initCamera();
+    </script>
+</body>
+</html>
